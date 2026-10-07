@@ -1,80 +1,70 @@
-# Prompt Regression Tester
+# Real-Time ML Serving
 
-A **Git-based prompt registry with automated CI regression gates**. Prompts live as versioned YAML files; every change runs a regression suite against a fixed test set and blocks merges that degrade quality past a threshold.
+A **production-style inference service** for real-time ML predictions: FastAPI + Redis feature caching + model monitoring with drift detection. The reference implementation is a fraud-detection scorer, but the serving layer is model-agnostic — swap in any sklearn-compatible classifier.
 
-## The problem it solves
-
-Prompt edits are code changes, but most teams edit them like config — no tests, no review, silent regressions in production. This gives prompts the same safety rails as code.
-
-## How it works
+## Architecture
 
 ```
-prompts/
-  summarizer.v1.yaml ─┐
-  summarizer.v2.yaml ─┴─▶ registry loads all versions
-                              │
-                              ▼
-                    regression.py runs each version
-                    against tests/cases.jsonl
-                              │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-              all metrics within      regression detected
-              tolerance → PASS        → FAIL (blocks merge)
+Client ──▶ FastAPI (/predict)
+              │
+              ├─▶ Redis feature cache (skip recompute on cache hit)
+              │
+              ├─▶ Model inference (XGBoost / sklearn pipeline)
+              │
+              └─▶ Monitoring: log prediction, latency, feature stats
+                       │
+                       ▼
+                 Drift detector (PSI) ──▶ alert when distribution shifts
 ```
 
 ## Quickstart
 
 ```bash
 pip install -r requirements.txt
-export OPENAI_API_KEY="sk-..."
-# run the regression suite for a prompt
-python src/regression.py --prompt summarizer --baseline v1 --candidate v2
+# train a demo model
+python src/train.py
+# serve it
+uvicorn src.app:app --reload
+# score a transaction
+curl -X POST localhost:8000/predict -H 'Content-Type: application/json' \
+  -d '{"amount": 250.0, "merchant_category": "travel", "hour_of_day": 14,
+       "days_since_last": 2, "avg_amount_30d": 180.0}'
 ```
 
-## Prompt file format (YAML)
+With Docker:
 
-```yaml
-name: summarizer
-version: v2
-model: gpt-4o-mini
-temperature: 0
-system: |
-  Summarize the following text in 2 sentences or fewer.
-  Preserve all numbers and dates exactly.
-changelog: "Tightened length constraint; added number preservation rule."
+```bash
+docker build -t ml-serving .
+docker run -p 8000:8000 ml-serving
 ```
 
-## Regression gates
+## Endpoints
 
-| Metric | Gate |
-|--------|------|
-| ROUGE-L vs expected | candidate ≥ baseline − 0.05 |
-| Avg output length | within ±30% of baseline |
-| Empty / refusal rate | must not increase |
-
-Exit code 0 = safe to merge. Exit code 1 = regression, block the PR.
-
-## CI example (GitHub Actions)
-
-```yaml
-- name: Prompt regression check
-  run: python src/regression.py --prompt ${{ matrix.prompt }} --baseline main --candidate HEAD
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/predict` | Score one event → `{fraud_probability, latency_ms, cached}` |
+| GET | `/health` | Liveness + model version |
+| GET | `/metrics` | Prediction count, p50/p99 latency, drift status |
 
 ## Project layout
 
 ```
 src/
-  registry.py     # Loads versioned YAML prompts, diffs versions
-  regression.py   # Runs cases, scores, enforces gates, exit codes
-prompts/
-  summarizer.v1.yaml
-  summarizer.v2.yaml
-tests/
-  cases.jsonl     # Fixed regression cases (never change these)
+  app.py         # FastAPI service: predict, health, metrics
+  model.py       # Model wrapper: load, predict, version
+  features.py    # Feature engineering + Redis cache layer
+  monitoring.py  # Prediction logging, PSI drift detection
+  train.py       # Trains a demo XGBoost fraud model on synthetic data
+Dockerfile
 ```
+
+## Key design decisions
+
+- **Redis feature cache** — repeated entities (same card/user) skip feature recomputation; big win at high QPS.
+- **Model versioning** — the model artifact carries a version string; `/health` exposes it so deploys are verifiable.
+- **PSI drift detection** — Population Stability Index on incoming feature distributions vs training baseline; alerts before accuracy silently degrades.
+- **Structured logging** — every prediction logs features, score, latency, and model version for offline analysis.
 
 ## Built with
 
-Python · PyYAML · OpenAI API · rouge-score
+Python · FastAPI · Redis · XGBoost · scikit-learn · Docker · Pydantic
